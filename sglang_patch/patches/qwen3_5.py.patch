@@ -1,0 +1,45 @@
+725,726c725,727
+<         _is_dola_extend = False
+<         if _dola_layers and forward_batch.forward_mode.is_extend():
+---
+>         _is_dola_active = False
+>         if _dola_layers and forward_batch.forward_mode.is_decode_or_idle():
+>             # DoLa during decode: capture candidate hidden states per token
+728c729,732
+<             if not hasattr(forward_batch, "dola_candidate_hidden"):
+---
+>             # Clear previous DoLa data to prevent memory leak
+>             if hasattr(forward_batch, "dola_candidate_hidden") and forward_batch.dola_candidate_hidden is not None:
+>                 forward_batch.dola_candidate_hidden.clear()
+>             else:
+730c734,749
+<             if not hasattr(forward_batch, "dola_candidate_residual"):
+---
+>             if hasattr(forward_batch, "dola_candidate_residual") and forward_batch.dola_candidate_residual is not None:
+>                 forward_batch.dola_candidate_residual.clear()
+>             else:
+>                 forward_batch.dola_candidate_residual = {}
+>             _is_dola_active = True
+>         elif _dola_layers and forward_batch.forward_mode.is_extend():
+>             # DoLa during prefill: capture candidate hidden states for MC2 + first token
+>             _dola_candidate_set = set(int(x) for x in _dola_layers.split(",") if x.strip())
+>             # Clear previous DoLa data to prevent memory leak
+>             if hasattr(forward_batch, "dola_candidate_hidden") and forward_batch.dola_candidate_hidden is not None:
+>                 forward_batch.dola_candidate_hidden.clear()
+>             else:
+>                 forward_batch.dola_candidate_hidden = {}
+>             if hasattr(forward_batch, "dola_candidate_residual") and forward_batch.dola_candidate_residual is not None:
+>                 forward_batch.dola_candidate_residual.clear()
+>             else:
+732c751
+<             _is_dola_extend = True
+---
+>             _is_dola_active = True
+734c753
+<             # Clear DoLa data for decode/idle to avoid CUDA graph issues
+---
+>             # Clear DoLa data for idle to avoid CUDA graph issues
+777c796
+<             if _is_dola_extend and layer_idx in _dola_candidate_set:
+---
+>             if _is_dola_active and layer_idx in _dola_candidate_set:

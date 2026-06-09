@@ -1,0 +1,239 @@
+17a18,19
+> import math
+> import os
+67c69,71
+<     post_softmax: bool = True,
+---
+>     post_softmax: bool = False,
+>     relative_top: float = 0.0,
+>     relative_top_value: float = -1000.0,
+69c73,78
+<     """DoLa contrastive decoding: JS divergence layer selection + log_softmax contrast.
+---
+>     """DoLa contrastive decoding: per-token JS divergence layer selection + log_softmax contrast.
+> 
+>     Aligned with DoLa/dola.py lm_score function (lines 161-217).
+>     For each token, independently select the premature layer with highest JS divergence.
+> 
+>     Memory-efficient implementation: compute JS divergence per-layer instead of stacking all.
+74c83,85
+<         post_softmax: whether to apply log_softmax after contrast
+---
+>         post_softmax: whether to apply log_softmax after contrast (default False for MC2 eval)
+>         relative_top: relative top filtering threshold (default 0.0 for MC2 eval)
+>         relative_top_value: value to assign to filtered tokens
+81a93,94
+>     num_tokens = final_logits.shape[0]
+> 
+83a97,128
+>         final_log_sm = final_f.log_softmax(dim=-1)  # (num_tokens, vocab)
+>         softmax_mature = torch.softmax(final_f, dim=-1)  # (num_tokens, vocab)
+>         # Per-token JS divergence layer selection (as in dola.py lines 175-201)
+>         # Memory-efficient: compute JS divergence for each layer separately
+>         # js_divs_per_layer shape: (num_layers, num_tokens)
+>         js_divs_per_layer = []
+>         for l in candidate_layers:
+>             cand_f = candidate_logits[l].float()
+>             softmax_premature = torch.softmax(cand_f, dim=-1)  # (num_tokens, vocab)
+>             log_softmax_premature = cand_f.log_softmax(dim=-1)  # (num_tokens, vocab)
+>             # M = 0.5 * (P + Q) for JS divergence
+>             M = 0.5 * (softmax_mature + softmax_premature)  # (num_tokens, vocab)
+> 
+>             # KL(P || M) and KL(Q || M)
+>             kl1 = F.kl_div(final_log_sm, M, reduction="none").mean(-1)  # (num_tokens,)
+>             kl2 = F.kl_div(log_softmax_premature, M, reduction="none").mean(-1)  # (num_tokens,)
+>             js_div = 0.5 * (kl1 + kl2)  # (num_tokens,)
+>             js_divs_per_layer.append(js_div)
+> 
+>         # Stack JS divergences: shape (num_layers, num_tokens)
+>         js_divs = torch.stack(js_divs_per_layer, dim=0)
+>         # Log JS divergence stats for analysis
+>         js_mean_per_layer = js_divs.mean(dim=-1).cpu().tolist()  # (num_layers,)
+>         js_log_str = "DOLA_JS: " + ",".join([f"{l}:{v:.15e}" for l, v in zip(candidate_layers, js_mean_per_layer)])
+>         print(js_log_str, flush=True)
+>         # Per-token selection: for each token, pick the layer with highest JS divergence
+>         picked_layer_indices = js_divs.argmax(dim=0)  # (num_tokens,)
+> 
+>         # Log per-token layer selection for analysis
+>         picked_layers_per_token = [candidate_layers[idx.item()] for idx in picked_layer_indices]
+>         layer_selection_str = "DOLA_LAYERS_SELECTED: " + ",".join(map(str, picked_layers_per_token))
+>         print(layer_selection_str, flush=True)
+85,100c130,131
+<         # Per-token JS divergence layer selection
+<         picked_layers = []
+<         for seq_i in range(final_f.shape[0]):
+<             stacked = torch.stack([candidate_logits[l][seq_i] for l in candidate_layers], dim=0)
+<             softmax_mature = torch.softmax(final_f[seq_i], dim=-1)
+<             softmax_premature = torch.softmax(stacked, dim=-1)
+<             M = 0.5 * (softmax_mature[None, :] + softmax_premature)
+<             log_softmax_mature = torch.log_softmax(final_f[seq_i], dim=-1)
+<             log_softmax_premature = torch.log_softmax(stacked, dim=-1)
+<             kl1 = F.kl_div(log_softmax_mature[None, :], M, reduction="none").mean(-1)
+<             kl2 = F.kl_div(log_softmax_premature, M, reduction="none").mean(-1)
+<             js_divs = 0.5 * (kl1 + kl2).mean(-1)
+<             picked = candidate_layers[int(js_divs.argmax().cpu().item())]
+<             picked_layers.append(picked)
+< 
+<         # Build base logits from picked layers
+---
+>         # Build base_logits by selecting the appropriate candidate for each token
+>         # As in dola.py lines 203-205
+102,103c133,136
+<         for i, l in enumerate(picked_layers):
+<             base_logits[i] = candidate_logits[l][i]
+---
+>         for token_idx in range(num_tokens):
+>             layer_idx = picked_layer_indices[token_idx].item()
+>             picked_layer = candidate_layers[layer_idx]
+>             base_logits[token_idx] = candidate_logits[picked_layer][token_idx]
+105,106c138
+<         # Contrast
+<         final_log_sm = final_f.log_softmax(dim=-1)
+---
+>         # Contrast: final - base (as in dola.py line 209)
+108a141
+> 
+111a145,156
+>         # Relative top filtering (as in dola.py lines 213-215)
+>         if relative_top > 0.0:
+>             scores_normalized = final_log_sm
+>             sorted_logits, _ = torch.sort(scores_normalized, descending=True)
+>             min_thresh = sorted_logits[..., 0]
+>             probs_max = torch.max(scores_normalized, dim=-1).values
+>             probs_thresh = probs_max + torch.log(torch.tensor(relative_top))
+>             probs_thresh = torch.min(min_thresh, probs_thresh)
+>             probs_thresh = probs_thresh.unsqueeze(-1)
+>             relative_top_mask = scores_normalized < probs_thresh
+>             diff_logits = torch.where(relative_top_mask, relative_top_value, diff_logits)
+> 
+127a173,182
+> 
+>     Args:
+>         candidate_hidden: {layer_idx: [num_tokens, hidden]} hidden states from candidate layers
+>         candidate_residual: {layer_idx: [num_tokens, hidden] or None} residual states
+>         norm_layer: RMSNorm layer to apply before lm_head
+>         logits_processor: LogitsProcessor instance
+>         lm_head: language model head
+>         logits_metadata: LogitsMetadata instance
+>         pruned_indices: list of (start, end) tuples to slice hidden states
+>                         If None, uses the last token only (for decode mode)
+134,137c189,197
+<             if res is not None:
+<                 normed, _ = norm_layer(hs, res)
+<             else:
+<                 normed = norm_layer(hs)
+---
+>             # DoLa 论文原始方法：不对中间层应用 norm，直接使用 hidden states
+>             # 这样可以保留各层输出的原始数值范围差异，使 JS 散度更大
+>             # if res is not None:
+>             #     normed, _ = norm_layer(hs, res)
+>             # else:
+>             #     normed = norm_layer(hs)
+>             normed = hs  # 不使用 norm，与论文对齐
+> 
+>             # Slice hidden states to match pruned_states
+138a199
+>                 # Extend mode with logprobs: slice multiple ranges
+139a201,205
+>             else:
+>                 # Decode mode: only need the last token
+>                 # pruned_states in decode mode contains only the last token
+>                 normed = normed[-1:]  # Keep as 2D tensor with shape [1, hidden]
+> 
+381c447,454
+<         if isinstance(logits_metadata, ForwardBatch):
+---
+>         _dola_pruned_indices = None  # for aligning candidate_hidden with pruned_states
+>         _dola_relative_top = 0.0  # relative top filtering strength (0 = disabled)
+>         _is_forward_batch = isinstance(logits_metadata, ForwardBatch)
+>         if _is_forward_batch:
+>             # Read relative_top from env: default 0.1 for decode, 0.0 for MC2 prefill
+>             _dola_rt_env = os.environ.get("DOLA_RELATIVE_TOP", "")
+>             if _dola_rt_env:
+>                 _dola_relative_top = float(_dola_rt_env)
+385a459,463
+>                 logger.debug(f"[DoLa] Extracted from ForwardBatch: {len(_dola_candidate_hidden)} candidate layers, relative_top={_dola_relative_top}")
+>             elif _dola_candidate_hidden is None:
+>                 logger.debug(f"[DoLa] No dola_candidate_hidden on ForwardBatch")
+>             else:
+>                 logger.debug(f"[DoLa] dola_candidate_hidden exists but no dola_norm")
+439a518,519
+>                 # For decode mode, we only need the last token's hidden state
+>                 # candidate_hidden contains all tokens, but we only need the last one
+442a523,526
+>                     pruned_indices=None,  # decode mode: pruned_states already has only last token
+>                 )
+>                 sampled_logits = _dola_contrast_logits(
+>                     sampled_logits, _dola_cand_logits, relative_top=_dola_relative_top
+444c528,532
+<                 sampled_logits = _dola_contrast_logits(sampled_logits, _dola_cand_logits)
+---
+>                 # Clear DoLa hidden states to prevent memory leak
+>                 if hasattr(logits_metadata, "dola_candidate_hidden"):
+>                     logits_metadata.dola_candidate_hidden = None
+>                 if hasattr(logits_metadata, "dola_candidate_residual"):
+>                     logits_metadata.dola_candidate_residual = None
+473a562
+>             is_dola_active = False
+475a565
+>                 # The logic mirrors _get_pruned_states for extend_return_logprob mode
+478,480c568,572
+<                 for start_len, extend_len in zip(
+<                     logits_metadata.extend_logprob_start_lens_cpu,
+<                     logits_metadata.extend_seq_lens_cpu,
+---
+>                 for idx, (extend_logprob_start_len, extend_len) in enumerate(
+>                     zip(
+>                         logits_metadata.extend_logprob_start_lens_cpu,
+>                         logits_metadata.extend_seq_lens_cpu,
+>                     )
+482,483c574,576
+<                     if extend_len == start_len:
+<                         actual_start = start_len - 1
+---
+>                     # Same logic as _get_pruned_states
+>                     if extend_len == extend_logprob_start_len:
+>                         start_len = extend_logprob_start_len - 1
+485,486c578,582
+<                         actual_start = start_len
+<                     _dola_pruned_indices.append((pt + actual_start, pt + extend_len))
+---
+>                         start_len = extend_logprob_start_len
+> 
+>                     # pruned_states slice is hidden_states[pt + start_len : pt + extend_len]
+>                     # So we need to slice candidate_hidden the same way
+>                     _dola_pruned_indices.append((pt + start_len, pt + extend_len))
+487a584
+> 
+493c590,598
+<                 logits = _dola_contrast_logits(logits, _dola_cand_logits)
+---
+>                 logits = _dola_contrast_logits(
+>                     logits, _dola_cand_logits, relative_top=_dola_relative_top
+>                 )
+>                 is_dola_active = True
+>                 # Clear DoLa hidden states to prevent memory leak
+>                 if hasattr(logits_metadata, "dola_candidate_hidden"):
+>                     logits_metadata.dola_candidate_hidden = None
+>                 if hasattr(logits_metadata, "dola_candidate_residual"):
+>                     logits_metadata.dola_candidate_residual = None
+501c606,608
+<             logprobs_result = self.process_input_logprobs(input_logits, logits_metadata)
+---
+>             logprobs_result = self.process_input_logprobs(
+>                 input_logits, logits_metadata, skip_log_softmax=is_dola_active
+>             )
+732,735c839,846
+<     def process_input_logprobs(self, input_logits, logits_metadata: LogitsMetadata):
+<         input_logprobs = compute_temp_top_p_normalized_logprobs(
+<             input_logits, logits_metadata
+<         )
+---
+>     def process_input_logprobs(self, input_logits, logits_metadata: LogitsMetadata, skip_log_softmax: bool = False):
+>         # DoLa: input_logits is already diff_logits (log_probs), skip log_softmax
+>         if skip_log_softmax:
+>             input_logprobs = input_logits
+>         else:
+>             input_logprobs = compute_temp_top_p_normalized_logprobs(
+>                 input_logits, logits_metadata
+>             )
